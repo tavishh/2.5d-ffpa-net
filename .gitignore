@@ -1,0 +1,36 @@
+# Data and outputs - never committed
+data/
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# PyTorch checkpoints
+*.pth
+*.pt
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+*.csv
+*.json*.zip
+*.zip
