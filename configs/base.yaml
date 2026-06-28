@@ -1,0 +1,55 @@
+# Base configuration for the 2.5D FFPA-Net.
+# Variant configs (configs/variants/*.yaml) inherit this via `_base_: ../base.yaml`
+# and override only experiment/data.three_slice/ffpa.fusion_variant.
+
+# Lines marked `# CONFIRM` were reconstructed and should be replaced with the
+
+experiment:
+  name: "base"
+  description: "base config (overridden by variant)"
+
+data:
+  root_dir: "data/muscle_top10"      # CONFIRM path to your dataset root
+  image_size: 256                    # CONFIRM (dataset default is 256)
+  batch_size: 8                      # CONFIRM
+  num_workers: 6
+  three_slice: false                 # variants flip this on for S1/S2
+
+model:
+  # 10 original mask IDs -> remapped to 1..10 (background = 0 => 11 channels).
+  selected_classes: [21, 34, 76, 90, 96, 200, 214, 241, 248, 255]  # CONFIRM IDs
+  remap_classes: true
+  num_classes: 1                     # overridden to len(selected)+1 when remapping
+
+ffpa:
+  base_channels: 40                  # CONFIRM (decoder base width)
+  fusion_variant: "S0_single_slice"  # overridden by variant
+  use_original_image: true
+  use_deep_supervision: true
+
+training:
+  epochs: 100                        # CONFIRM
+  learning_rate: 0.001               # CONFIRM
+  weight_decay: 0.0001               # CONFIRM
+  device: "cuda"
+  val_interval: 1
+  save_interval: 20
+  early_stopping:
+    enabled: true
+    patience: 15                     # CONFIRM
+    min_delta: 0.001
+
+loss:
+  weight_dice: 0.5                   # CONFIRM
+  weight_ce: 0.5                     # CONFIRM (used as weight_bce in binary mode)
+
+evaluation:
+  threshold: 0.5
+  save_predictions: true
+
+debug:
+  enabled: false
+  subset_ratio: 0.1
+  verbose: false
+
+seed: 42

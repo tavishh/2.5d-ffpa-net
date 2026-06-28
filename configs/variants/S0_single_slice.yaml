@@ -1,0 +1,12 @@
+_base_: ../base.yaml
+
+# S0 — single-slice 2D baseline (control row for the slice-fusion ablation).
+experiment:
+  name: "S0_single_slice"
+  description: "2D baseline — single slice, no cross-slice fusion"
+
+data:
+  three_slice: false
+
+ffpa:
+  fusion_variant: "S0_single_slice"

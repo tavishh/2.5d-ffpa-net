@@ -1,36 +1,21 @@
-# Data and outputs - never committed
+# Results / checkpoints (large; keep results/README.md only)
+results/*
+!results/README.md
+*.pth
+*.ckpt
+
+# Data (point config.data.root_dir at your local copy)
 data/
-outputs/
 
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
+*.egg-info/
+.ipynb_checkpoints/
 .venv/
 venv/
-env/
-*.egg-info/
-dist/
-build/
 
-# PyTorch checkpoints
-*.pth
-*.pt
-
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb
-
-# macOS
+# OS / editor
 .DS_Store
-
-# IDE
-.vscode/
 .idea/
-*.swp
-
-# Logs
-*.log
-*.csv
-*.json*.zip
-*.zip
+.vscode/

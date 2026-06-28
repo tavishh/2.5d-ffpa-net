@@ -1,0 +1,14 @@
+_base_: ../base.yaml
+
+# S2 — input fusion (cheap reference): CSA over the raw 3-channel stack before a
+# single filter pass. NOT equal-compute vs S1 (1x vs 3x filtering) — report
+# FLOPs separately; treat as a fusion-strategy comparison, not same-cost.
+experiment:
+  name: "S2_input_fusion"
+  description: "2.5D — input-stage raw-slice CSA fusion (early fusion baseline)"
+
+data:
+  three_slice: true
+
+ffpa:
+  fusion_variant: "S2_input_fusion"

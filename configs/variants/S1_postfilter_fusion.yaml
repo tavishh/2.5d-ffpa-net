@@ -1,0 +1,14 @@
+_base_: ../base.yaml
+
+# S1 — PRIMARY. Post-filter slice fusion: each slice filtered independently,
+# then a per-scale SliceCSA fuses the three feature groups along the slice axis.
+# Cost note: the (zero-parameter) filter bank runs 3x per forward.
+experiment:
+  name: "S1_postfilter_fusion"
+  description: "2.5D — post-filter SliceCSA fusion (primary variant)"
+
+data:
+  three_slice: true
+
+ffpa:
+  fusion_variant: "S1_postfilter_fusion"
