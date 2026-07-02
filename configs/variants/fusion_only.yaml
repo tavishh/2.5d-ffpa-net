@@ -1,0 +1,25 @@
+_base_: ../base.yaml
+
+# fusion_only — ABLATION CONTROL for S1_postfilter_fusion. Same forward path as
+# S1 (each slice filtered independently, 3x filter-bank passes, same residual
+# structure) but the slice-axis fusion uses FIXED uniform (1/S) weights
+# (MeanSliceFusion, 0 params) instead of SliceCSA's LEARNED softmax attention
+# (~110 params/scale). Isolates whether SliceCSA's learned attention is doing
+# anything, vs. any S1 gain coming purely from running the filter bank on all
+# 3 slices rather than just the centre slice.
+#
+# IMPORTANT: deliberately inherits identical epochs / early_stopping / seed
+# from base.yaml as S1_postfilter_fusion.yaml -- do not shorten this run.
+# The first S1 run (20 fixed epochs) showed a flat result vs baseline; a
+# second S1 run trained to convergence (early-stopped ~epoch 43) showed a
+# real +0.026 knee Dice gain. If fusion_only is compared against S1 at
+# different training lengths, the comparison is meaningless.
+experiment:
+  name: "fusion_only"
+  description: "2.5D — post-filter fusion, fixed uniform weights (no attention, ablation control)"
+
+data:
+  three_slice: true
+
+ffpa:
+  fusion_variant: "fusion_only"

@@ -15,9 +15,18 @@ Variants (config["ffpa"]["fusion_variant"]):
                            per-scale SliceCSA fuses 3 -> 1 along the slice axis.
     S2_input_fusion      : cheap reference. CSA over the raw 3-channel stack
                            before a single filter-bank pass (early fusion).
+    fusion_only          : ABLATION CONTROL for S1. Identical forward path to
+                           S1 (3x filter bank, per-scale fusion, same residual
+                           structure) but the slice-axis fusion uses FIXED
+                           uniform (1/S) weights (MeanSliceFusion) instead of
+                           SliceCSA's LEARNED softmax attention. Zero extra
+                           parameters. Isolates whether SliceCSA's learned
+                           attention is doing anything, vs. any gain coming
+                           purely from running the filter bank on all 3 slices.
 
-Cost: S1 runs the zero-parameter filter bank 3x per forward; S0/S2 run it once.
-SliceCSA is ~110 params per scale at F=10.
+Cost: S1 and fusion_only both run the zero-parameter filter bank 3x per
+forward; S0/S2 run it once.
+SliceCSA is ~110 params per scale at F=10; MeanSliceFusion is 0 params.
 """
 
 import torch
@@ -25,16 +34,26 @@ import torch.nn as nn
 
 from .fixed_filters import FixedFilterBank
 from .slice_fusion import MultiScaleSliceFusion
+from .mean_fusion import MultiScaleMeanFusion
 from .csa import CrossSliceAttention
 from .decoder import ProgressiveAttentionDecoder
 
 
 # Maps fusion_variant -> (three_slice_input, use_postfilter_fusion, use_input_fusion)
+# fusion_only shares S1's forward path (three_slice=True, use_postfilter=True) --
+# the only difference is which class gets instantiated for self.slice_fusion,
+# handled below in __init__, not here.
 FUSION_VARIANTS = {
     "S0_single_slice":      (False, False, False),
     "S1_postfilter_fusion": (True,  True,  False),
     "S2_input_fusion":      (True,  False, True),
+    "fusion_only":          (True,  True,  False),
 }
+
+# Variants that use the fixed-weight MeanSliceFusion instead of learned SliceCSA
+# at the post-filter fusion stage. Kept as an explicit set (rather than inferring
+# from the name) so a future variant can opt in without a naming convention.
+_MEAN_FUSION_VARIANTS = {"fusion_only"}
 
 
 class FFPANet25D(nn.Module):
@@ -75,10 +94,16 @@ class FFPANet25D(nn.Module):
         self.use_input_fusion = use_input
         self.num_slices = 3 if three_slice else 1
 
+        # Which class implements post-filter fusion for this variant.
+        self._uses_mean_fusion = self.fusion_variant in _MEAN_FUSION_VARIANTS
+        fusion_label = ("MeanSliceFusion (fixed 1/S, 0 params, ablation control)"
+                        if self._uses_mean_fusion else
+                        "SliceCSA (learned attention)")
+
         print(f"  Initializing FFPANet25D variant='{self.fusion_variant}' "
               f"with {self.num_classes} output classes")
         print(f"    3-slice input:        {self.three_slice}")
-        print(f"    post-filter fusion:   {self.use_postfilter_fusion}  (SliceCSA)")
+        print(f"    post-filter fusion:   {self.use_postfilter_fusion}  ({fusion_label})")
         print(f"    input fusion:         {self.use_input_fusion}  (raw-stack CSA)")
 
         # ── Fixed filter bank (single-channel, unchanged from 2D FFPA-Net) ──
@@ -88,14 +113,24 @@ class FFPANet25D(nn.Module):
         )
         feature_dims = [10, 10, 10]
 
-        # ── S1: per-scale SliceCSA that fuses 3 slice-feature groups -> 1 ───
+        # ── S1 / fusion_only: per-scale fusion of 3 slice-feature groups -> 1 ──
+        # Same call signature for both classes: (per_slice_features) -> list of
+        # 3 fused (B,F,H,W) maps. forward() below does not need to know which
+        # class this is.
         if self.use_postfilter_fusion:
-            self.slice_fusion = MultiScaleSliceFusion(
-                feature_dims=feature_dims,
-                num_slices=3,
-                residual_center=True,
-                shared_score=True,
-            )
+            if self._uses_mean_fusion:
+                self.slice_fusion = MultiScaleMeanFusion(
+                    feature_dims=feature_dims,
+                    num_slices=3,
+                    residual_center=True,   # must match S1 for a valid control
+                )
+            else:
+                self.slice_fusion = MultiScaleSliceFusion(
+                    feature_dims=feature_dims,
+                    num_slices=3,
+                    residual_center=True,
+                    shared_score=True,
+                )
 
         # ── S2: CSA over the raw 3-channel slice stack (early fusion) ───────
         if self.use_input_fusion:
@@ -136,7 +171,8 @@ class FFPANet25D(nn.Module):
     def forward(self, x, return_aux: bool = False):
         """
         Args:
-            x: (B, 1, H, W) for S0; (B, 3, H, W) for S1/S2 (prev, curr, next).
+            x: (B, 1, H, W) for S0; (B, 3, H, W) for S1/S2/fusion_only
+               (prev, curr, next).
             return_aux: if True and deep supervision enabled, return tuple.
         """
         if self.three_slice:
@@ -150,7 +186,9 @@ class FFPANet25D(nn.Module):
                 features = self._maybe_fuse_original(features, centre)
 
             else:
-                # ── S1: filter EACH slice, then SliceCSA fuses 3 -> 1 ───────
+                # ── S1 / fusion_only: filter EACH slice, then fuse 3 -> 1 ───
+                # self.slice_fusion is either SliceCSA-based (S1) or
+                # MeanSliceFusion-based (fusion_only) -- identical call here.
                 per_slice_features = [
                     self._filter_one(x[:, s:s + 1, :, :]) for s in range(3)
                 ]
