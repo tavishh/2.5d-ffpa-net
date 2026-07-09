@@ -1,0 +1,33 @@
+_base_: ../base.yaml
+
+# relational_fusion — REDESIGN targeting the specific weakness diagnosed in
+# SliceCSA: it scores each slice INDEPENDENTLY (same shared conv applied to
+# x_s alone), so it can never express "does this neighbour agree with the
+# centre" -- only "does this slice look important on its own." This variant
+# replaces that with a centre-referenced relational descriptor
+# [x_s, x_centre, x_s-x_centre, |x_s-x_centre|] through a shared 3x3 conv,
+# with NO residual (centre must earn its influence via its unique
+# zero-difference signature, not have it hardcoded).
+#
+# Grounded in the literature: XAG-Net/S1's independent-scoring design sits at
+# the most primitive end of the published cross-slice attention spectrum.
+# More recent designs (CSA-Net 2024, RSANet MICCAI 2019) moved toward
+# relational/similarity-based comparison instead. This variant is a
+# deliberately lightweight version of that same direction -- ~10,830 params
+# total (~7% FLOPs overhead), vs. CSA-Net's full spatial cross-attention
+# (tens of millions of params, only tractable after 16x downsampling).
+#
+# IMPORTANT: inherits identical epochs / early_stopping / seed from base.yaml
+# as S1_postfilter_fusion.yaml and fusion_only.yaml -- do not shorten this
+# run. Undertraining produced a misleading flat result once already (S1's
+# first 20-epoch run); this must train to its own convergence point to be
+# a fair three-way comparison against S1 and fusion_only.
+experiment:
+  name: "relational_fusion"
+  description: "2.5D — relational (centre-referenced) attention fusion, no residual"
+
+data:
+  three_slice: true
+
+ffpa:
+  fusion_variant: "relational_fusion"

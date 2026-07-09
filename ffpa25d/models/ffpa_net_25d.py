@@ -23,10 +23,20 @@ Variants (config["ffpa"]["fusion_variant"]):
                            parameters. Isolates whether SliceCSA's learned
                            attention is doing anything, vs. any gain coming
                            purely from running the filter bank on all 3 slices.
+    relational_fusion    : REDESIGN. Same forward path as S1/fusion_only, but
+                           each slice's attention logit is computed from an
+                           explicit RELATIONAL descriptor referenced against the
+                           centre slice (x_s, x_centre, x_s-x_centre, |x_s-x_centre|)
+                           via a shared 3x3 conv, with NO residual (centre must
+                           earn its influence via its unique zero-difference
+                           signature rather than having it hardcoded). Targets
+                           the specific weakness diagnosed in SliceCSA: scoring
+                           slices independently rather than comparing them.
 
-Cost: S1 and fusion_only both run the zero-parameter filter bank 3x per
-forward; S0/S2 run it once.
-SliceCSA is ~110 params per scale at F=10; MeanSliceFusion is 0 params.
+Cost: S1, fusion_only, and relational_fusion all run the zero-parameter filter
+bank 3x per forward; S0/S2 run it once.
+SliceCSA: ~110 params/scale. MeanSliceFusion: 0 params/scale.
+RelationalSliceFusion: ~3610 params/scale (3x3 conv, 4F->F channels).
 """
 
 import torch
@@ -35,25 +45,31 @@ import torch.nn as nn
 from .fixed_filters import FixedFilterBank
 from .slice_fusion import MultiScaleSliceFusion
 from .mean_fusion import MultiScaleMeanFusion
+from .relational_fusion import MultiScaleRelationalFusion
 from .csa import CrossSliceAttention
 from .decoder import ProgressiveAttentionDecoder
 
 
 # Maps fusion_variant -> (three_slice_input, use_postfilter_fusion, use_input_fusion)
-# fusion_only shares S1's forward path (three_slice=True, use_postfilter=True) --
-# the only difference is which class gets instantiated for self.slice_fusion,
-# handled below in __init__, not here.
+# fusion_only and relational_fusion share S1's forward path (three_slice=True,
+# use_postfilter=True) -- the only difference is which class gets instantiated
+# for self.slice_fusion, handled below in __init__, not here.
 FUSION_VARIANTS = {
     "S0_single_slice":      (False, False, False),
     "S1_postfilter_fusion": (True,  True,  False),
     "S2_input_fusion":      (True,  False, True),
     "fusion_only":          (True,  True,  False),
+    "relational_fusion":    (True,  True,  False),
 }
 
 # Variants that use the fixed-weight MeanSliceFusion instead of learned SliceCSA
 # at the post-filter fusion stage. Kept as an explicit set (rather than inferring
 # from the name) so a future variant can opt in without a naming convention.
 _MEAN_FUSION_VARIANTS = {"fusion_only"}
+
+# Variants that use the relational (centre-referenced) fusion instead of
+# SliceCSA's independent-per-slice scoring.
+_RELATIONAL_FUSION_VARIANTS = {"relational_fusion"}
 
 
 class FFPANet25D(nn.Module):
@@ -96,9 +112,13 @@ class FFPANet25D(nn.Module):
 
         # Which class implements post-filter fusion for this variant.
         self._uses_mean_fusion = self.fusion_variant in _MEAN_FUSION_VARIANTS
-        fusion_label = ("MeanSliceFusion (fixed 1/S, 0 params, ablation control)"
-                        if self._uses_mean_fusion else
-                        "SliceCSA (learned attention)")
+        self._uses_relational_fusion = self.fusion_variant in _RELATIONAL_FUSION_VARIANTS
+        if self._uses_mean_fusion:
+            fusion_label = "MeanSliceFusion (fixed 1/S, 0 params, ablation control)"
+        elif self._uses_relational_fusion:
+            fusion_label = "RelationalSliceFusion (centre-referenced, learned, no residual)"
+        else:
+            fusion_label = "SliceCSA (learned, independent per-slice scoring)"
 
         print(f"  Initializing FFPANet25D variant='{self.fusion_variant}' "
               f"with {self.num_classes} output classes")
@@ -113,16 +133,21 @@ class FFPANet25D(nn.Module):
         )
         feature_dims = [10, 10, 10]
 
-        # ── S1 / fusion_only: per-scale fusion of 3 slice-feature groups -> 1 ──
-        # Same call signature for both classes: (per_slice_features) -> list of
-        # 3 fused (B,F,H,W) maps. forward() below does not need to know which
-        # class this is.
+        # ── S1 / fusion_only / relational_fusion: fuse 3 slice-feature groups
+        # -> 1 per scale. Same call signature for all three classes:
+        # (per_slice_features) -> list of 3 fused (B,F,H,W) maps. forward()
+        # below does not need to know which class this is.
         if self.use_postfilter_fusion:
             if self._uses_mean_fusion:
                 self.slice_fusion = MultiScaleMeanFusion(
                     feature_dims=feature_dims,
                     num_slices=3,
                     residual_center=True,   # must match S1 for a valid control
+                )
+            elif self._uses_relational_fusion:
+                self.slice_fusion = MultiScaleRelationalFusion(
+                    feature_dims=feature_dims,
+                    num_slices=3,
                 )
             else:
                 self.slice_fusion = MultiScaleSliceFusion(
