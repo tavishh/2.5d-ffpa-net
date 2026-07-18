@@ -7,36 +7,36 @@ original-image fusion) is identical. The fixed single-channel filter bank
 destroys the slice axis once a centre slice is chosen, while XAG-Net's CSA needs
 the channel axis to be the slice axis. The one window where features exist and
 the slice axis still exists is immediately after per-slice filtering, so fusion
-(SliceCSA) happens there and the decoder needs no change.
+happens there and the decoder needs no change.
 
 Variants (config["ffpa"]["fusion_variant"]):
     S0_single_slice      : 2D baseline. Input (B,1,H,W), no neighbours.
-    S1_postfilter_fusion : primary. Input (B,3,H,W); each slice filtered, then a
-                           per-scale SliceCSA fuses 3 -> 1 along the slice axis.
-    S2_input_fusion      : cheap reference. CSA over the raw 3-channel stack
+    S1_postfilter_fusion : each slice filtered, then a per-scale SliceCSA fuses
+                           N -> 1 along the slice axis via INDEPENDENT per-slice
+                           softmax attention (no direct slice-to-slice comparison).
+    S2_input_fusion      : cheap reference. CSA over the raw N-channel stack
                            before a single filter-bank pass (early fusion).
     fusion_only          : ABLATION CONTROL for S1. Identical forward path to
-                           S1 (3x filter bank, per-scale fusion, same residual
-                           structure) but the slice-axis fusion uses FIXED
-                           uniform (1/S) weights (MeanSliceFusion) instead of
-                           SliceCSA's LEARNED softmax attention. Zero extra
-                           parameters. Isolates whether SliceCSA's learned
-                           attention is doing anything, vs. any gain coming
-                           purely from running the filter bank on all 3 slices.
+                           S1 but slice-axis fusion uses FIXED uniform (1/N)
+                           weights (MeanSliceFusion) instead of SliceCSA's
+                           learned softmax. Zero extra parameters.
     relational_fusion    : REDESIGN. Same forward path as S1/fusion_only, but
                            each slice's attention logit is computed from an
                            explicit RELATIONAL descriptor referenced against the
                            centre slice (x_s, x_centre, x_s-x_centre, |x_s-x_centre|)
-                           via a shared 3x3 conv, with NO residual (centre must
-                           earn its influence via its unique zero-difference
-                           signature rather than having it hardcoded). Targets
-                           the specific weakness diagnosed in SliceCSA: scoring
-                           slices independently rather than comparing them.
+                           via a shared 3x3 conv, with NO residual.
+
+Number of slices (config["data"]["num_slices"], default 3): controls how many
+neighbouring slices get stacked and fused for any of the multi-slice variants
+above (S1, S2, fusion_only, relational_fusion). Must be odd. This is decoupled
+from fusion_variant so any slice-count can be combined with any fusion
+mechanism without adding new variant names.
 
 Cost: S1, fusion_only, and relational_fusion all run the zero-parameter filter
-bank 3x per forward; S0/S2 run it once.
-SliceCSA: ~110 params/scale. MeanSliceFusion: 0 params/scale.
-RelationalSliceFusion: ~3610 params/scale (3x3 conv, 4F->F channels).
+bank N times per forward (N = num_slices); S0/S2 run it once. SliceCSA is
+~110 params/scale regardless of N (shared_score). MeanSliceFusion: 0 params.
+RelationalSliceFusion: ~3610 params/scale (3x3 conv, 4F->F channels),
+independent of N.
 """
 
 import torch
@@ -53,7 +53,9 @@ from .decoder import ProgressiveAttentionDecoder
 # Maps fusion_variant -> (three_slice_input, use_postfilter_fusion, use_input_fusion)
 # fusion_only and relational_fusion share S1's forward path (three_slice=True,
 # use_postfilter=True) -- the only difference is which class gets instantiated
-# for self.slice_fusion, handled below in __init__, not here.
+# for self.slice_fusion, handled below in __init__, not here. The actual
+# NUMBER of slices (3, 5, ...) is a separate, orthogonal config key read
+# directly in __init__, not part of this dict.
 FUSION_VARIANTS = {
     "S0_single_slice":      (False, False, False),
     "S1_postfilter_fusion": (True,  True,  False),
@@ -63,8 +65,7 @@ FUSION_VARIANTS = {
 }
 
 # Variants that use the fixed-weight MeanSliceFusion instead of learned SliceCSA
-# at the post-filter fusion stage. Kept as an explicit set (rather than inferring
-# from the name) so a future variant can opt in without a naming convention.
+# at the post-filter fusion stage.
 _MEAN_FUSION_VARIANTS = {"fusion_only"}
 
 # Variants that use the relational (centre-referenced) fusion instead of
@@ -73,7 +74,7 @@ _RELATIONAL_FUSION_VARIANTS = {"relational_fusion"}
 
 
 class FFPANet25D(nn.Module):
-    """2.5D FFPA-Net with selectable slice-fusion strategy.
+    """2.5D FFPA-Net with selectable slice-fusion strategy and slice count.
 
     Args:
         config: experiment config dict. Reads:
@@ -82,6 +83,7 @@ class FFPANet25D(nn.Module):
             config["ffpa"]["fusion_variant"]             (default S0_single_slice)
             config["ffpa"]["use_original_image"]         (default True)
             config["ffpa"]["use_deep_supervision"]       (default True)
+            config["data"]["num_slices"]                 (default 3, must be odd)
             config["training"]["device"]
         base_channels: decoder base width (config typically sets 40).
     """
@@ -108,13 +110,26 @@ class FFPANet25D(nn.Module):
         self.three_slice = three_slice
         self.use_postfilter_fusion = use_postfilter
         self.use_input_fusion = use_input
-        self.num_slices = 3 if three_slice else 1
+
+        # Number of slices is a separate, orthogonal config key (defaults to 3
+        # so every existing config that doesn't set it behaves exactly as
+        # before). Only meaningful when three_slice=True.
+        requested_num_slices = config.get("data", {}).get("num_slices", 3)
+        if self.three_slice:
+            if requested_num_slices < 1 or requested_num_slices % 2 == 0:
+                raise ValueError(
+                    f"data.num_slices must be odd and >= 1, got {requested_num_slices}"
+                )
+            self.num_slices = requested_num_slices
+        else:
+            self.num_slices = 1
+        self.center_idx = self.num_slices // 2  # e.g. 3->1, 5->2, 7->3
 
         # Which class implements post-filter fusion for this variant.
         self._uses_mean_fusion = self.fusion_variant in _MEAN_FUSION_VARIANTS
         self._uses_relational_fusion = self.fusion_variant in _RELATIONAL_FUSION_VARIANTS
         if self._uses_mean_fusion:
-            fusion_label = "MeanSliceFusion (fixed 1/S, 0 params, ablation control)"
+            fusion_label = "MeanSliceFusion (fixed 1/N, 0 params, ablation control)"
         elif self._uses_relational_fusion:
             fusion_label = "RelationalSliceFusion (centre-referenced, learned, no residual)"
         else:
@@ -122,7 +137,8 @@ class FFPANet25D(nn.Module):
 
         print(f"  Initializing FFPANet25D variant='{self.fusion_variant}' "
               f"with {self.num_classes} output classes")
-        print(f"    3-slice input:        {self.three_slice}")
+        print(f"    3-slice input:        {self.three_slice}"
+              + (f"  (num_slices={self.num_slices})" if self.three_slice else ""))
         print(f"    post-filter fusion:   {self.use_postfilter_fusion}  ({fusion_label})")
         print(f"    input fusion:         {self.use_input_fusion}  (raw-stack CSA)")
 
@@ -133,33 +149,34 @@ class FFPANet25D(nn.Module):
         )
         feature_dims = [10, 10, 10]
 
-        # ── S1 / fusion_only / relational_fusion: fuse 3 slice-feature groups
+        # ── S1 / fusion_only / relational_fusion: fuse N slice-feature groups
         # -> 1 per scale. Same call signature for all three classes:
         # (per_slice_features) -> list of 3 fused (B,F,H,W) maps. forward()
-        # below does not need to know which class this is.
+        # below does not need to know which class this is. All three classes
+        # are already parameterized by num_slices, so no change needed there.
         if self.use_postfilter_fusion:
             if self._uses_mean_fusion:
                 self.slice_fusion = MultiScaleMeanFusion(
                     feature_dims=feature_dims,
-                    num_slices=3,
+                    num_slices=self.num_slices,
                     residual_center=True,   # must match S1 for a valid control
                 )
             elif self._uses_relational_fusion:
                 self.slice_fusion = MultiScaleRelationalFusion(
                     feature_dims=feature_dims,
-                    num_slices=3,
+                    num_slices=self.num_slices,
                 )
             else:
                 self.slice_fusion = MultiScaleSliceFusion(
                     feature_dims=feature_dims,
-                    num_slices=3,
+                    num_slices=self.num_slices,
                     residual_center=True,
                     shared_score=True,
                 )
 
-        # ── S2: CSA over the raw 3-channel slice stack (early fusion) ───────
+        # ── S2: CSA over the raw N-channel slice stack (early fusion) ───────
         if self.use_input_fusion:
-            self.csa_input = CrossSliceAttention(in_channels=3)
+            self.csa_input = CrossSliceAttention(in_channels=self.num_slices)
 
         # ── Decoder (identical to 2D FFPA-Net) ─────────────────────────────
         self.decoder = ProgressiveAttentionDecoder(
@@ -171,6 +188,8 @@ class FFPANet25D(nn.Module):
         )
 
         # ── Original-image fusion: centre slice (1ch) + scale-0 feats (10ch) ─
+        # Always exactly 1 centre channel regardless of num_slices, so this
+        # conv's input dim (11 = 10 + 1) never changes with slice count.
         if self.use_original:
             self.original_fusion = nn.Sequential(
                 nn.Conv2d(11, 16, 3, padding=1),
@@ -196,29 +215,31 @@ class FFPANet25D(nn.Module):
     def forward(self, x, return_aux: bool = False):
         """
         Args:
-            x: (B, 1, H, W) for S0; (B, 3, H, W) for S1/S2/fusion_only
-               (prev, curr, next).
+            x: (B, 1, H, W) for S0; (B, num_slices, H, W) for S1/S2/fusion_only/
+               relational_fusion (e.g. prev, curr, next for num_slices=3;
+               prev2, prev, curr, next, next2 for num_slices=5).
             return_aux: if True and deep supervision enabled, return tuple.
         """
         if self.three_slice:
-            self._check_3ch(x)
+            self._check_slice_count(x)
 
             if self.use_input_fusion:
                 # ── S2: mix neighbours into channels, then ONE filter pass ──
-                x = self.csa_input(x)                # (B, 3, H, W)
-                centre = x[:, 1:2, :, :]             # (B, 1, H, W)
+                x = self.csa_input(x)                                       # (B, N, H, W)
+                centre = x[:, self.center_idx:self.center_idx + 1, :, :]    # (B, 1, H, W)
                 features = self._filter_one(centre)
                 features = self._maybe_fuse_original(features, centre)
 
             else:
-                # ── S1 / fusion_only: filter EACH slice, then fuse 3 -> 1 ───
-                # self.slice_fusion is either SliceCSA-based (S1) or
-                # MeanSliceFusion-based (fusion_only) -- identical call here.
+                # ── S1 / fusion_only / relational_fusion: filter EACH slice,
+                # then fuse N -> 1. self.slice_fusion is SliceCSA-based (S1),
+                # MeanSliceFusion-based (fusion_only), or RelationalSliceFusion
+                # -based (relational_fusion) -- identical call here.
                 per_slice_features = [
-                    self._filter_one(x[:, s:s + 1, :, :]) for s in range(3)
+                    self._filter_one(x[:, s:s + 1, :, :]) for s in range(self.num_slices)
                 ]
                 features = self.slice_fusion(per_slice_features)  # list of 3 scales
-                centre = x[:, 1:2, :, :]
+                centre = x[:, self.center_idx:self.center_idx + 1, :, :]
                 features = self._maybe_fuse_original(features, centre)
         else:
             # ── S0: original 2D path ───────────────────────────────────────
@@ -229,13 +250,14 @@ class FFPANet25D(nn.Module):
         use_ds = return_aux and self.use_deep_supervision
         return self.decoder(features, return_aux=use_ds)
 
-    def _check_3ch(self, x):
-        if x.dim() != 4 or x.size(1) != 3:
+    def _check_slice_count(self, x):
+        if x.dim() != 4 or x.size(1) != self.num_slices:
             raise ValueError(
-                f"fusion_variant='{self.fusion_variant}' expects a 3-channel "
-                f"(prev,curr,next) input of shape (B,3,H,W), but got "
-                f"{tuple(x.shape)}. Set data.three_slice=True so the dataset "
-                f"returns stacked slices."
+                f"fusion_variant='{self.fusion_variant}' with num_slices="
+                f"{self.num_slices} expects input shape (B,{self.num_slices},H,W), "
+                f"but got {tuple(x.shape)}. Set data.three_slice=True and "
+                f"data.num_slices={self.num_slices} so the dataset returns "
+                f"correctly stacked slices."
             )
 
     def count_parameters(self):

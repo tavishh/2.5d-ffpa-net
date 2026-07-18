@@ -1,0 +1,25 @@
+_base_: ../base.yaml
+
+# fusion_only_5slice -- tests whether MORE temporal context helps, using the
+# uniform-averaging control (fusion_only) rather than a learned-attention
+# variant. This is a deliberate choice: we still don't have a statistically
+# confirmed answer on whether learned attention (S1) beats simple averaging
+# (fusion_only) at 3 slices. Testing 5 slices with a learned-attention variant
+# would confound two open questions in one experiment -- "does more context
+# help" and "does learned attention help" -- making the result impossible to
+# interpret cleanly. Using fusion_only isolates the slice-count question on
+# its own.
+#
+# Everything else (epochs, early stopping, seed) matches every prior run in
+# this series for a fair comparison against the 3-slice fusion_only result
+# (knee Dice_FG 0.7411, overall 0.8772).
+experiment:
+  name: "fusion_only_5slice"
+  description: "2.5D -- 5-slice window, fixed uniform weights (no attention)"
+
+data:
+  three_slice: true
+  num_slices: 5
+
+ffpa:
+  fusion_variant: "fusion_only"

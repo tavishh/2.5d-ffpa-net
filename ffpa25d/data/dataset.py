@@ -22,10 +22,12 @@ class PatientSliceDataset(Dataset):
     """Dataset for patient-slice structured segmentation data.
 
     Args:
-        three_slice (bool): If True, return a 3-channel image formed by
-            stacking [prev, current, next] slices from the same patient.
-            If False (default), return the original single-channel image.
-            Set to True for all 2.5D variants; False for the 2D baseline.
+        three_slice (bool): If True, return a multi-channel image formed by
+            stacking neighbouring slices from the same patient. If False
+            (default), return the original single-channel image.
+        num_slices (int): Only used when three_slice=True. Number of slices
+            to stack (must be odd): 3 = [prev, curr, next], 5 = [prev2, prev1,
+            curr, next1, next2], etc. Defaults to 3 for backward compatibility.
     """
 
     def __init__(
@@ -39,6 +41,7 @@ class PatientSliceDataset(Dataset):
         subset_ratio=1.0,
         verbose=False,
         three_slice=False,
+        num_slices=3,
     ):
         self.root_dir = Path(root_dir)
         self.split = split
@@ -50,9 +53,15 @@ class PatientSliceDataset(Dataset):
         self.is_binary = num_classes == 1
         self.three_slice = three_slice
 
+        if three_slice:
+            if num_slices < 1 or num_slices % 2 == 0:
+                raise ValueError(f"num_slices must be odd and >= 1, got {num_slices}")
+        self.num_slices = num_slices if three_slice else 1
+        self._half_window = self.num_slices // 2  # e.g. 3->1, 5->2, 7->3
+
         print(f"\nInitializing {split} dataset from {root_dir}")
         if three_slice:
-            print("  Mode: 3-slice stacking (2.5D)")
+            print(f"  Mode: {self.num_slices}-slice stacking (2.5D)")
 
         if not self.is_binary and selected_classes and remap_classes:
             # start=1 so foreground classes remap to 1..N and background
@@ -145,13 +154,15 @@ class PatientSliceDataset(Dataset):
     def _get_neighbor_idx(self, flat_idx, offset):
         """Return flat index of neighbor at +/- offset, clamped within patient.
 
-        Implements replicate (boundary) padding: asking for the slice before
-        the first slice of a patient returns the first slice; asking for the
-        slice after the last returns the last.
+        Implements replicate (boundary) padding: asking for a slice before
+        the first slice of a patient returns the first slice; asking for a
+        slice after the last returns the last. Works for ANY offset magnitude
+        (not just +/-1), so this needs no change to support wider windows.
 
         Args:
             flat_idx: flat index of the current sample in self.samples
-            offset: -1 for previous slice, +1 for next slice
+            offset: signed integer offset (e.g. -2, -1, +1, +2 for a 5-slice
+                window)
 
         Returns:
             flat index of the neighbor (or boundary slice if edge case)
@@ -191,26 +202,31 @@ class PatientSliceDataset(Dataset):
         sample = self.samples[idx]
 
         if self.three_slice:
-            # ── 2.5D path: stack [prev, current, next] along channel dim ──────
-            # Neighbors are clamped to patient boundaries (replicate padding).
-            prev_idx = self._get_neighbor_idx(idx, -1)
-            next_idx = self._get_neighbor_idx(idx, +1)
+            # ── 2.5D path: stack [prev...curr...next] along channel dim ──────
+            # Generalized to any odd window size via _half_window. For
+            # num_slices=3, offsets are [-1, 0, +1] (unchanged from before).
+            # For num_slices=5, offsets are [-2, -1, 0, +1, +2]. Neighbors are
+            # clamped to patient boundaries (replicate padding) regardless of
+            # window size.
+            imgs = []
+            for offset in range(-self._half_window, self._half_window + 1):
+                if offset == 0:
+                    neighbor_idx = idx
+                else:
+                    neighbor_idx = self._get_neighbor_idx(idx, offset)
+                imgs.append(self._load_image(self.samples[neighbor_idx]["image_path"]))
 
-            prev_img = self._load_image(self.samples[prev_idx]["image_path"])
-            curr_img = self._load_image(sample["image_path"])
-            next_img = self._load_image(self.samples[next_idx]["image_path"])
-
-            # Stack to (3, H, W) and normalise to [0, 1].
-            image = np.stack([prev_img, curr_img, next_img], axis=0).astype(np.float32)
+            # Stack to (num_slices, H, W) and normalise to [0, 1].
+            image = np.stack(imgs, axis=0).astype(np.float32)
             image = torch.from_numpy(image) / 255.0
-            # image shape: (3, H, W)
+            # image shape: (num_slices, H, W)
         else:
             # ── 2D baseline path: single-channel, unchanged behaviour ─────────
             curr_img = self._load_image(sample["image_path"])
             image = torch.from_numpy(curr_img).float().unsqueeze(0) / 255.0
             # image shape: (1, H, W)
 
-        # ── Mask (same for both 2D and 2.5D - we only segment the centre slice) ──
+        # ── Mask (same regardless of window size - we only segment the centre slice) ──
         mask = self._load_mask(sample["mask_path"])
 
         if self.is_binary:
@@ -259,8 +275,11 @@ def create_dataloaders(config):
     subset_ratio = config.get("debug", {}).get("subset_ratio", 1.0)
     verbose = config.get("debug", {}).get("verbose", False)
 
-    # three_slice flag read from config; defaults to False (2D baseline)
+    # three_slice flag read from config; defaults to False (2D baseline).
+    # num_slices only matters when three_slice=True; defaults to 3 so every
+    # existing config (which doesn't set this key) is unaffected.
     three_slice = config.get("data", {}).get("three_slice", False)
+    num_slices = config.get("data", {}).get("num_slices", 3)
 
     if selected_classes and remap_classes:
         # +1 for background at index 0 (foreground remapped to 1..N)
@@ -272,7 +291,7 @@ def create_dataloaders(config):
     print(f"  Number of classes: {num_classes}")
     if selected_classes:
         print(f"  Selected classes: {selected_classes}")
-    print(f"  3-slice mode: {three_slice}")
+    print(f"  3-slice mode: {three_slice}" + (f"  (num_slices={num_slices})" if three_slice else ""))
 
     common_kwargs = {
         "root_dir": config["data"]["root_dir"],
@@ -282,6 +301,7 @@ def create_dataloaders(config):
         "remap_classes": remap_classes,
         "verbose": verbose,
         "three_slice": three_slice,
+        "num_slices": num_slices,
     }
 
     train_dataset = PatientSliceDataset(
