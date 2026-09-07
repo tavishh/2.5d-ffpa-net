@@ -1,0 +1,30 @@
+_base_: ../base.yaml
+
+# fusion_only_position -- tests Henson et al.'s SC-UNet mechanism (PLOS ONE,
+# 2024), reproduced precisely after reading the source paper: a percentage-
+# along-the-limb value (bucketed 0-99), one-hot encoded, passed through a
+# small FC layer (100 -> num_classes) running in PARALLEL to the segmentation
+# network, whose output multiplicatively gates the decoder's final output
+# (and every deep-supervision auxiliary output) channel-wise. No change to
+# the slice-fusion mechanism, the filter bank, or the decoder itself.
+#
+# Deliberately isolated on top of fusion_only (not S1 or relational_fusion):
+# the attention-mechanism question is separately already answered (Section 6
+# of the checkpoint doc -- no fusion mechanism beats simple averaging).
+# Testing position gating on top of a still-unresolved attention mechanism
+# would confound two open questions in one experiment, the same reasoning
+# that kept fusion_only_5slice isolated from the attention question earlier.
+#
+# Everything else (epochs, early stopping, seed) matches every prior run in
+# this series for a fair comparison against the existing fusion_only result
+# (knee Dice_FG 0.7411, knee detection rate 93.51%).
+experiment:
+  name: "fusion_only_position"
+  description: "2.5D -- fusion_only + SC-UNet-style positional gate (Henson et al.)"
+
+data:
+  three_slice: true
+  use_position_encoding: true
+
+ffpa:
+  fusion_variant: "fusion_only"

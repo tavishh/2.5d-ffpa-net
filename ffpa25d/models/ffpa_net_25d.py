@@ -32,15 +32,35 @@ above (S1, S2, fusion_only, relational_fusion). Must be odd. This is decoupled
 from fusion_variant so any slice-count can be combined with any fusion
 mechanism without adding new variant names.
 
+Positional encoding (config["data"]["use_position_encoding"], default False,
+added 2026-09, corrected after reading the source paper): reproduces Henson et
+al.'s SC-UNet mechanism (PLOS ONE, 2024) precisely, NOT an approximation:
+  - the dataset computes a percentage-along-the-limb bucket (0-99) for each
+    slice (see dataset.py's _get_position_bucket)
+  - this model converts that bucket to a 100-element one-hot vector, passes it
+    through a SEPARATE, small fully-connected layer (100 -> num_classes) --
+    running in PARALLEL to the segmentation backbone, not mixed into the image
+    input at any point
+  - the FC layer's output (one scalar per class) multiplicatively GATES the
+    decoder's final output (and every deep-supervision auxiliary output, if
+    enabled), channel-wise -- exactly as described in the paper ("multiplied
+    with the result of the final convolutional layer")
+An earlier version of this feature concatenated a constant-valued position
+channel into the image input instead; that was a plausible-sounding guess
+made before the source paper was available, not a reproduction of the actual
+method, and has been replaced by this version.
+
 Cost: S1, fusion_only, and relational_fusion all run the zero-parameter filter
 bank N times per forward (N = num_slices); S0/S2 run it once. SliceCSA is
 ~110 params/scale regardless of N (shared_score). MeanSliceFusion: 0 params.
 RelationalSliceFusion: ~3610 params/scale (3x3 conv, 4F->F channels),
-independent of N.
+independent of N. Positional encoding adds a single Linear(100, num_classes)
+layer -- negligible parameter/compute cost regardless of num_classes.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .fixed_filters import FixedFilterBank
 from .slice_fusion import MultiScaleSliceFusion
@@ -54,8 +74,8 @@ from .decoder import ProgressiveAttentionDecoder
 # fusion_only and relational_fusion share S1's forward path (three_slice=True,
 # use_postfilter=True) -- the only difference is which class gets instantiated
 # for self.slice_fusion, handled below in __init__, not here. The actual
-# NUMBER of slices (3, 5, ...) is a separate, orthogonal config key read
-# directly in __init__, not part of this dict.
+# NUMBER of slices (3, 5, ...) and positional encoding are separate, orthogonal
+# config keys read directly in __init__, not part of this dict.
 FUSION_VARIANTS = {
     "S0_single_slice":      (False, False, False),
     "S1_postfilter_fusion": (True,  True,  False),
@@ -72,9 +92,14 @@ _MEAN_FUSION_VARIANTS = {"fusion_only"}
 # SliceCSA's independent-per-slice scoring.
 _RELATIONAL_FUSION_VARIANTS = {"relational_fusion"}
 
+# Number of position buckets for the SC-UNet-style gate. Matches the paper's
+# "100 input neurons representing each percentage along the lower limb".
+_NUM_POSITION_BUCKETS = 100
+
 
 class FFPANet25D(nn.Module):
-    """2.5D FFPA-Net with selectable slice-fusion strategy and slice count.
+    """2.5D FFPA-Net with selectable slice-fusion strategy, slice count, and
+    optional SC-UNet-style positional gating.
 
     Args:
         config: experiment config dict. Reads:
@@ -84,6 +109,7 @@ class FFPANet25D(nn.Module):
             config["ffpa"]["use_original_image"]         (default True)
             config["ffpa"]["use_deep_supervision"]       (default True)
             config["data"]["num_slices"]                 (default 3, must be odd)
+            config["data"]["use_position_encoding"]      (default False)
             config["training"]["device"]
         base_channels: decoder base width (config typically sets 40).
     """
@@ -125,6 +151,13 @@ class FFPANet25D(nn.Module):
             self.num_slices = 1
         self.center_idx = self.num_slices // 2  # e.g. 3->1, 5->2, 7->3
 
+        # Positional encoding (SC-UNet style): another separate, orthogonal
+        # config key (defaults to False, so every existing config is
+        # unaffected). Unlike num_slices, this does NOT touch the image input
+        # at all -- it is a fully parallel pathway (see forward()).
+        self.use_position = config.get("data", {}).get("use_position_encoding", False)
+        self._warned_missing_position = False  # see forward(): one-time warning, not a hard error
+
         # Which class implements post-filter fusion for this variant.
         self._uses_mean_fusion = self.fusion_variant in _MEAN_FUSION_VARIANTS
         self._uses_relational_fusion = self.fusion_variant in _RELATIONAL_FUSION_VARIANTS
@@ -141,6 +174,9 @@ class FFPANet25D(nn.Module):
               + (f"  (num_slices={self.num_slices})" if self.three_slice else ""))
         print(f"    post-filter fusion:   {self.use_postfilter_fusion}  ({fusion_label})")
         print(f"    input fusion:         {self.use_input_fusion}  (raw-stack CSA)")
+        print(f"    position gate:        {self.use_position}"
+              + ("  (SC-UNet style, 100-bucket -> Linear -> multiplicative gate)"
+                 if self.use_position else ""))
 
         # ── Fixed filter bank (single-channel, unchanged from 2D FFPA-Net) ──
         self.feature_extractor = FixedFilterBank(
@@ -178,7 +214,7 @@ class FFPANet25D(nn.Module):
         if self.use_input_fusion:
             self.csa_input = CrossSliceAttention(in_channels=self.num_slices)
 
-        # ── Decoder (identical to 2D FFPA-Net) ─────────────────────────────
+        # ── Decoder (identical to 2D FFPA-Net, untouched by position gating) ─
         self.decoder = ProgressiveAttentionDecoder(
             in_channels=feature_dims,
             base_channels=base_channels,
@@ -188,8 +224,8 @@ class FFPANet25D(nn.Module):
         )
 
         # ── Original-image fusion: centre slice (1ch) + scale-0 feats (10ch) ─
-        # Always exactly 1 centre channel regardless of num_slices, so this
-        # conv's input dim (11 = 10 + 1) never changes with slice count.
+        # Unaffected by positional encoding -- always 11 channels, since
+        # position no longer touches the image/feature pathway at all.
         if self.use_original:
             self.original_fusion = nn.Sequential(
                 nn.Conv2d(11, 16, 3, padding=1),
@@ -197,6 +233,12 @@ class FFPANet25D(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Conv2d(16, 10, 1),
             )
+
+        # ── SC-UNet-style position gate: 100-bucket one-hot -> Linear ->
+        # one scalar per output class, later multiplied into the decoder's
+        # output(s). This is the ENTIRE extra parameter cost of this feature.
+        if self.use_position:
+            self.position_gate = nn.Linear(_NUM_POSITION_BUCKETS, self.num_classes)
 
     # ── helpers ────────────────────────────────────────────────────────────
     def _filter_one(self, single_channel):
@@ -211,13 +253,29 @@ class FFPANet25D(nn.Module):
             features[0] = self.original_fusion(combined)
         return features
 
+    def _apply_position_gate(self, output, position):
+        """Multiplicatively gate a (B, num_classes, H, W) tensor by the
+        SC-UNet-style per-class position score. Broadcasts over H, W.
+
+        Args:
+            output: (B, num_classes, H, W) -- decoder output or an aux head.
+            position: (B,) long tensor, bucket indices in [0, 99].
+        """
+        position_onehot = F.one_hot(position, num_classes=_NUM_POSITION_BUCKETS).float()  # (B,100)
+        gate = self.position_gate(position_onehot)          # (B, num_classes)
+        gate = gate.view(gate.size(0), gate.size(1), 1, 1)   # (B, num_classes, 1, 1)
+        return output * gate
+
     # ── forward ──────────────────────────────────────────────────────────────
-    def forward(self, x, return_aux: bool = False):
+    def forward(self, x, position=None, return_aux: bool = False):
         """
         Args:
-            x: (B, 1, H, W) for S0; (B, num_slices, H, W) for S1/S2/fusion_only/
-               relational_fusion (e.g. prev, curr, next for num_slices=3;
-               prev2, prev, curr, next, next2 for num_slices=5).
+            x: (B, num_slices, H, W). NOT affected by positional encoding --
+               position travels as a fully separate argument (matching
+               SC-UNet's genuinely parallel pathway), not packed into x.
+            position: (B,) long tensor of bucket indices in [0, 99], required
+                if use_position_encoding=True (ignored otherwise, with a
+                warning if the config expected it but it was not provided).
             return_aux: if True and deep supervision enabled, return tuple.
         """
         if self.three_slice:
@@ -248,7 +306,39 @@ class FFPANet25D(nn.Module):
             features = self._maybe_fuse_original(features, centre)
 
         use_ds = return_aux and self.use_deep_supervision
-        return self.decoder(features, return_aux=use_ds)
+        decoder_out = self.decoder(features, return_aux=use_ds)
+
+        # ── SC-UNet-style position gate: applied AFTER the decoder, to its
+        # final output and every deep-supervision auxiliary output, exactly
+        # matching "multiplied with the result of the final convolutional
+        # layer in the UNet structure" from the source paper. The decoder
+        # itself (shared across every variant) is completely untouched.
+        if self.use_position:
+            if position is None:
+                # metrics.py's get_model_efficiency (FLOPs / inference-time
+                # measurement, called at the end of every Evaluator.evaluate())
+                # calls this model with a dummy image tensor and NO position
+                # argument -- that is a legitimate, expected caller, not a bug.
+                # A real wiring problem (e.g. the trainer.py patch not applied)
+                # would ALSO hit this path during actual training/validation,
+                # so we still warn -- just once, not 100+ times inside the
+                # FLOPs/timing loops -- rather than crash either caller.
+                if not self._warned_missing_position:
+                    print("  WARNING: use_position_encoding=True but no position "
+                          "tensor was passed to forward() -- skipping the position "
+                          "gate for this call. Expected during FLOPs/inference-time "
+                          "measurement; if this appears during real training or "
+                          "evaluation instead, the trainer.py position-passing patch "
+                          "may not be applied correctly.")
+                    self._warned_missing_position = True
+                # Skip gating entirely this call -- decoder_out passed through unchanged.
+            else:
+                if isinstance(decoder_out, tuple):
+                    decoder_out = tuple(self._apply_position_gate(o, position) for o in decoder_out)
+                else:
+                    decoder_out = self._apply_position_gate(decoder_out, position)
+
+        return decoder_out
 
     def _check_slice_count(self, x):
         if x.dim() != 4 or x.size(1) != self.num_slices:

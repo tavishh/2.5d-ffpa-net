@@ -7,6 +7,13 @@ Training + evaluation engine for the 2.5D FFPA-Net.
 
 The Evaluator writes summary.json with the keys analysis/make_tables.py expects
 (dice / dice_fg / hd95 / num_slices / training).
+
+Positional encoding (2026-09): when a batch includes a "position" field (i.e.
+the dataset was built with use_position_encoding=True), it is extracted here
+and passed through to the model as its own argument -- it is NOT part of the
+image tensor. Both _run_epoch (train + val) and Evaluator.evaluate do this
+identically. batch.get("position") returns None for every existing config
+that doesn't use this feature, so nothing changes for any prior run.
 """
 import csv
 import json
@@ -130,16 +137,22 @@ class Trainer:
             for batch in tqdm(loader, desc=desc, leave=False):
                 images = batch["image"].to(self.device)
                 masks = batch["mask"].to(self.device)
+                # Positional encoding (SC-UNet style): None for every config
+                # that doesn't use this feature, so no behaviour change there.
+                position = batch.get("position")
+                if position is not None:
+                    position = position.to(self.device)
                 if train:
                     self.optimizer.zero_grad()
-                    outputs = self.model(images, return_aux=self.use_deep_supervision)
+                    outputs = self.model(images, position=position,
+                                         return_aux=self.use_deep_supervision)
                     loss = self.criterion(outputs, masks)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.optimizer.step()
                     main = outputs[0] if isinstance(outputs, tuple) else outputs
                 else:
-                    outputs = self.model(images, return_aux=False)
+                    outputs = self.model(images, position=position, return_aux=False)
                     loss = self.criterion(outputs, masks)
                     main = outputs
                 total_loss += loss.item()
@@ -193,7 +206,12 @@ class Evaluator:
                 images = batch["image"].to(self.device)
                 masks = batch["mask"].to(self.device)
                 pids, snames = batch["patient_id"], batch["slice_name"]
-                outputs = self.model(images, return_aux=False)
+                # Positional encoding (SC-UNet style): None for every config
+                # that doesn't use this feature, so no behaviour change there.
+                position = batch.get("position")
+                if position is not None:
+                    position = position.to(self.device)
+                outputs = self.model(images, position=position, return_aux=False)
                 for i in range(images.size(0)):
                     pid = pids[i] if isinstance(pids, list) else pids
                     sname = snames[i] if isinstance(snames, list) else snames
@@ -237,11 +255,8 @@ class Evaluator:
     def _save_slice_metrics(self, slices):
         if not slices:
             return
-        # NEW columns (detect_tp/fn/fp/tn) appended AFTER the existing ones.
-        # csv.DictReader (used by every existing analysis script -- e.g.
-        # compute_regional_metrics.py) reads by column NAME, not position, so
-        # this is safe: old scripts that only look up dice_fg/hd95/etc. are
-        # completely unaffected by the new columns being present.
+        # detect_tp/fn/fp/tn appended AFTER the original columns -- additive,
+        # existing analysis scripts (which read by column name) are unaffected.
         fields = ["patient_id", "slice_name", "dice", "dice_fg", "iou", "iou_fg", "hd95",
                   "detect_tp", "detect_fn", "detect_fp", "detect_tn"]
         with open(self.output_dir / "slice_metrics.csv", "w", newline="") as f:
@@ -256,6 +271,7 @@ class Evaluator:
                     "detect_tp": m.get("detect_tp", 0), "detect_fn": m.get("detect_fn", 0),
                     "detect_fp": m.get("detect_fp", 0), "detect_tn": m.get("detect_tn", 0),
                 })
+
     @staticmethod
     def _print(summary, eff, m):
         print("\n" + "=" * 64)

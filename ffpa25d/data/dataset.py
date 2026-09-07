@@ -1,8 +1,20 @@
 """Patient-slice dataset and dataloader factory.
 
-2.5D modification: __getitem__ returns a 3-channel image tensor formed by
-stacking the previous, current, and next slice from the SAME patient volume.
-Edge slices are padded by repeating the boundary slice (replicate padding).
+2.5D modification: __getitem__ returns a multi-channel image tensor formed by
+stacking neighbouring slices from the SAME patient volume. Edge slices are
+padded by repeating the boundary slice (replicate padding).
+
+Positional encoding (SC-UNet style, Henson et al. 2024, PLOS ONE): optionally
+returns an additional "position" field -- an integer bucket (0-99) representing
+this slice's percentage position along its patient's volume. This matches the
+ACTUAL SC-UNet mechanism after reading the source paper: a percentage-along-
+the-limb value converted to a 100-element one-hot vector, fed through a small
+fully-connected layer running in PARALLEL to the segmentation network (not
+mixed into the image input). The model (ffpa_net_25d.py) builds the one-hot
+vector and the FC layer; this file only computes the bucket index, using the
+same per-patient index already built for neighbour lookup -- no hand-curated
+region annotation needed, and available identically for every patient in
+every split.
 
 Key invariant: slices within each patient are sorted by filename before the
 flat sample list is built. A per-patient index map (self._patient_slice_idx)
@@ -28,6 +40,10 @@ class PatientSliceDataset(Dataset):
         num_slices (int): Only used when three_slice=True. Number of slices
             to stack (must be odd): 3 = [prev, curr, next], 5 = [prev2, prev1,
             curr, next1, next2], etc. Defaults to 3 for backward compatibility.
+        use_position_encoding (bool): If True, each sample's dict includes a
+            "position" field -- an integer in [0, 99] giving this slice's
+            percentage position along its patient's volume (SC-UNet style).
+            Defaults to False. Independent of three_slice/num_slices.
     """
 
     def __init__(
@@ -42,6 +58,7 @@ class PatientSliceDataset(Dataset):
         verbose=False,
         three_slice=False,
         num_slices=3,
+        use_position_encoding=False,
     ):
         self.root_dir = Path(root_dir)
         self.split = split
@@ -52,6 +69,7 @@ class PatientSliceDataset(Dataset):
         self.verbose = verbose
         self.is_binary = num_classes == 1
         self.three_slice = three_slice
+        self.use_position_encoding = use_position_encoding
 
         if three_slice:
             if num_slices < 1 or num_slices % 2 == 0:
@@ -62,6 +80,8 @@ class PatientSliceDataset(Dataset):
         print(f"\nInitializing {split} dataset from {root_dir}")
         if three_slice:
             print(f"  Mode: {self.num_slices}-slice stacking (2.5D)")
+        if use_position_encoding:
+            print(f"  Position encoding: ON (SC-UNet style, 100-bucket % along limb)")
 
         if not self.is_binary and selected_classes and remap_classes:
             # start=1 so foreground classes remap to 1..N and background
@@ -109,6 +129,8 @@ class PatientSliceDataset(Dataset):
         # _patient_slice_count[patient_id] = total slices for that patient.
         # These are computed ONCE here so __getitem__ can find neighbors in O(1)
         # without any scanning, and crucially without ever crossing boundaries.
+        # The SAME index is reused below for the positional-encoding bucket --
+        # no extra bookkeeping needed.
         self._build_patient_index()
 
         original_count = len(self.samples)
@@ -172,6 +194,25 @@ class PatientSliceDataset(Dataset):
         # Clamp to [first, last] - replicate padding at patient boundaries.
         neighbor = max(first, min(last, neighbor))
         return neighbor
+
+    def _get_position_bucket(self, flat_idx, num_buckets=100):
+        """Return this slice's percentage-along-the-limb bucket, in [0, num_buckets-1].
+
+        SC-UNet style (Henson et al. 2024): a percentage-along-the-limb value
+        converted to one of num_buckets discrete positions. Bucket 0 = first
+        slice of this patient, bucket num_buckets-1 = last slice. Uses the
+        same _patient_boundaries index already built for neighbour lookup --
+        no dependency on hand-curated region labels (unlike the calf/knee/
+        thigh boundaries used for regional evaluation elsewhere in this
+        project). Available identically for every patient in every split.
+        """
+        first, last = self._patient_boundaries[flat_idx]
+        total_minus_one = max(last - first, 1)  # avoid div-by-zero for a
+        # single-slice patient (degenerate case, shouldn't occur in practice)
+        normalized = (flat_idx - first) / total_minus_one  # in [0.0, 1.0]
+        bucket = int(normalized * num_buckets)
+        return min(bucket, num_buckets - 1)  # clamp: normalized==1.0 must map
+        # to the last valid bucket (num_buckets-1), not num_buckets (out of range)
 
     # ── Core I/O ──────────────────────────────────────────────────────────────
 
@@ -242,12 +283,21 @@ class PatientSliceDataset(Dataset):
                         new_mask[mask_locations] = remapped_id
                 mask = new_mask
 
-        return {
+        item = {
             "image": image,
             "mask": mask,
             "patient_id": sample["patient_id"],
             "slice_name": sample["slice_name"],
         }
+
+        # ── Positional encoding: a SEPARATE field, not mixed into the image ──
+        # SC-UNet feeds this through its own parallel FC pathway (see
+        # ffpa_net_25d.py), not through the conv backbone -- so it does not
+        # belong inside the image tensor at all.
+        if self.use_position_encoding:
+            item["position"] = torch.tensor(self._get_position_bucket(idx), dtype=torch.long)
+
+        return item
 
     def get_class_info(self):
         if self.class_mapping:
@@ -280,6 +330,7 @@ def create_dataloaders(config):
     # existing config (which doesn't set this key) is unaffected.
     three_slice = config.get("data", {}).get("three_slice", False)
     num_slices = config.get("data", {}).get("num_slices", 3)
+    use_position_encoding = config.get("data", {}).get("use_position_encoding", False)
 
     if selected_classes and remap_classes:
         # +1 for background at index 0 (foreground remapped to 1..N)
@@ -292,6 +343,7 @@ def create_dataloaders(config):
     if selected_classes:
         print(f"  Selected classes: {selected_classes}")
     print(f"  3-slice mode: {three_slice}" + (f"  (num_slices={num_slices})" if three_slice else ""))
+    print(f"  Position encoding: {use_position_encoding}")
 
     common_kwargs = {
         "root_dir": config["data"]["root_dir"],
@@ -302,6 +354,7 @@ def create_dataloaders(config):
         "verbose": verbose,
         "three_slice": three_slice,
         "num_slices": num_slices,
+        "use_position_encoding": use_position_encoding,
     }
 
     train_dataset = PatientSliceDataset(
