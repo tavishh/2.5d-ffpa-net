@@ -49,8 +49,19 @@ def set_seed(seed: int = 42):
 
 
 def resolve_device(requested: str = "cuda") -> str:
-    """Return `requested` unless cuda was asked for but is unavailable."""
-    if requested == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available, using CPU")
+    """Return `requested` unless cuda was asked for but is unavailable.
+
+    Falls back through: CUDA -> MPS (Apple Silicon GPU) -> CPU. Only affects
+    machines without CUDA (e.g. this Mac) -- Anning's CUDA runs are completely
+    unaffected, since torch.cuda.is_available() is checked first and returns
+    immediately if True.
+    """
+    if requested == "cuda":
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            print("CUDA not available, using MPS (Apple GPU)")
+            return "mps"
+        print("CUDA/MPS not available, using CPU")
         return "cpu"
     return requested

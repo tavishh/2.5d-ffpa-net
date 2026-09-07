@@ -237,7 +237,13 @@ class Evaluator:
     def _save_slice_metrics(self, slices):
         if not slices:
             return
-        fields = ["patient_id", "slice_name", "dice", "dice_fg", "iou", "iou_fg", "hd95"]
+        # NEW columns (detect_tp/fn/fp/tn) appended AFTER the existing ones.
+        # csv.DictReader (used by every existing analysis script -- e.g.
+        # compute_regional_metrics.py) reads by column NAME, not position, so
+        # this is safe: old scripts that only look up dice_fg/hd95/etc. are
+        # completely unaffected by the new columns being present.
+        fields = ["patient_id", "slice_name", "dice", "dice_fg", "iou", "iou_fg", "hd95",
+                  "detect_tp", "detect_fn", "detect_fp", "detect_tn"]
         with open(self.output_dir / "slice_metrics.csv", "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
@@ -246,8 +252,10 @@ class Evaluator:
                     "patient_id": m["patient_id"], "slice_name": m["slice_name"],
                     "dice": f"{m['dice']:.6f}", "dice_fg": f"{m['dice_fg']:.6f}",
                     "iou": f"{m['iou']:.6f}", "iou_fg": f"{m['iou_fg']:.6f}",
-                    "hd95": f"{m['hd95']:.6f}" if np.isfinite(m["hd95"]) else "inf"})
-
+                    "hd95": f"{m['hd95']:.6f}" if np.isfinite(m["hd95"]) else "inf",
+                    "detect_tp": m.get("detect_tp", 0), "detect_fn": m.get("detect_fn", 0),
+                    "detect_fp": m.get("detect_fp", 0), "detect_tn": m.get("detect_tn", 0),
+                })
     @staticmethod
     def _print(summary, eff, m):
         print("\n" + "=" * 64)

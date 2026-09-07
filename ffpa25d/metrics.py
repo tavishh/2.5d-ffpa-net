@@ -5,10 +5,20 @@ All segmentation metrics are computed at the 2D slice level:
   - dice / iou      : include background, empty classes score 1.0 (PFA-V2 style)
   - dice_fg / iou_fg: foreground only, SKIP empty classes (original FFPA-Net)
   - hd95            : foreground only
+  - detect_*        : per-class presence/absence counts (NEW, additive -- see below)
 
 The public entry points used by the pipeline are compute_dice_both /
 compute_iou_both (training + accumulator), compute_slice_metrics,
 MetricsAccumulator, and get_model_efficiency.
+
+Detection-rate addition (2026-08): dice_fg scores a class 0.0 whenever it is
+present in exactly one of (prediction, target) -- this conflates two very
+different failure modes into one number:
+  - a class present in target but NOT predicted at all (a genuine miss)
+  - a class predicted but NOT present in target at all (a hallucination)
+_compute_detection_counts distinguishes these directly. This is purely
+additive: every existing key/column/metric is unchanged, this only adds new
+ones alongside them.
 """
 import torch
 import torch.nn as nn
@@ -293,20 +303,86 @@ def _compute_hd95_from_masks(pred_mask: torch.Tensor, target_mask: torch.Tensor,
     return hd95
 
 
+# ============================================================================
+# Detection-rate metric (NEW, additive)
+# ============================================================================
+
+def _compute_detection_counts(pred: torch.Tensor, target: torch.Tensor,
+                              num_classes: int) -> Dict[str, int]:
+    """
+    Per-slice, per-foreground-class presence/absence counts.
+
+    dice_fg scores a class 0.0 whenever it is present in exactly one of
+    (prediction, target) -- this conflates two different failure modes into
+    one number. This function separates them:
+      - detect_tp: class present in BOTH target and prediction (a real
+        detection, regardless of how good the overlap is)
+      - detect_fn: class present in target, ABSENT from prediction (a
+        genuine miss -- e.g. a thin/tapering muscle the model failed to
+        find at all)
+      - detect_fp: class ABSENT from target, present in prediction (a
+        hallucination)
+      - detect_tn: class absent from both (correctly predicted nothing)
+
+    Only foreground classes (1..num_classes-1) are counted, matching the
+    dice_fg / iou_fg convention elsewhere in this file. Counts, not rates,
+    are returned so they can be summed correctly across slices before a
+    rate is computed at the accumulator level (summing rates directly would
+    incorrectly weight slices with fewer evaluated classes).
+
+    Args:
+        pred: [C, H, W] logits (or already-argmaxed [H, W] class map)
+        target: [H, W] class indices
+        num_classes: total classes including background (class 0)
+    """
+    if pred.dim() == 3:
+        pred_classes = torch.argmax(pred, dim=0)
+    else:
+        pred_classes = pred
+    target = target.squeeze()
+
+    tp = fn = fp = tn = 0
+    for c in range(1, num_classes):
+        pred_present = bool((pred_classes == c).any())
+        target_present = bool((target == c).any())
+
+        if target_present and pred_present:
+            tp += 1
+        elif target_present and not pred_present:
+            fn += 1
+        elif not target_present and pred_present:
+            fp += 1
+        else:
+            tn += 1
+
+    return {'detect_tp': tp, 'detect_fn': fn, 'detect_fp': fp, 'detect_tn': tn}
+
+
 def compute_slice_metrics(pred: torch.Tensor, target: torch.Tensor,
                           num_classes: int = 1, threshold: float = 0.5) -> Dict[str, float]:
-    """Compute all metrics (dice, dice_fg, iou, iou_fg, hd95) for one 2D slice."""
+    """Compute all metrics (dice, dice_fg, iou, iou_fg, hd95, detection) for one 2D slice."""
     dice_bg, dice_fg = compute_dice_both(pred, target, num_classes, threshold)
     iou_bg, iou_fg = compute_iou_both(pred, target, num_classes, threshold)
     hd95 = compute_hd95(pred, target, num_classes, threshold, include_background=False)
 
-    return {
+    metrics = {
         'dice': dice_bg,
         'dice_fg': dice_fg,
         'iou': iou_bg,
         'iou_fg': iou_fg,
         'hd95': hd95
     }
+
+    if num_classes > 1:
+        metrics.update(_compute_detection_counts(pred, target, num_classes))
+    else:
+        # Binary segmentation collapses to a single foreground class -- not
+        # the case this metric was built for (it exists to distinguish
+        # WHICH of several tracked classes was missed). Report zeros rather
+        # than guessing at a definition nobody asked for.
+        metrics.update({'detect_tp': 0, 'detect_fn': 0, 'detect_fp': 0, 'detect_tn': 0})
+
+    return metrics
 
 
 # ============================================================================
@@ -513,6 +589,31 @@ class MetricsAccumulator:
             },
             'num_slices': len(self.slice_metrics),
             'num_patients': len(self.patient_slice_map)
+        }
+
+        # ---- NEW, additive: detection-rate summary ----
+        # Sum raw counts across slices first, THEN take a rate -- summing
+        # per-slice rates directly would incorrectly over-weight slices that
+        # had fewer evaluated classes.
+        total_tp = sum(m.get('detect_tp', 0) for m in self.slice_metrics)
+        total_fn = sum(m.get('detect_fn', 0) for m in self.slice_metrics)
+        total_fp = sum(m.get('detect_fp', 0) for m in self.slice_metrics)
+        total_tn = sum(m.get('detect_tn', 0) for m in self.slice_metrics)
+
+        denom_rate = total_tp + total_fn
+        denom_fpr = total_fp + total_tn
+        summary['detection'] = {
+            # Of classes truly present, fraction the model actually predicted
+            # (regardless of overlap quality) -- distinguishes real misses
+            # from the harsh dice_fg=0.0 floor, which conflates misses with
+            # hallucinations.
+            'detection_rate': (total_tp / denom_rate) if denom_rate > 0 else float('nan'),
+            # Of classes truly absent, fraction the model hallucinated.
+            'false_positive_rate': (total_fp / denom_fpr) if denom_fpr > 0 else float('nan'),
+            'true_positive': total_tp,
+            'false_negative': total_fn,
+            'false_positive': total_fp,
+            'true_negative': total_tn,
         }
 
         return summary
