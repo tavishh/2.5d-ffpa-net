@@ -1,0 +1,29 @@
+_base_: ../base.yaml
+
+# fusion_only_gatefloor -- tests whether a floor on the attention gate's output
+# helps recover thin/tapering structures at the failure zones. Motivated by
+# tracing the exact decoder code: the gate at the FINEST scale (att1) is
+# conditioned on a signal derived from the COARSEST scale (64x64) -- a thin
+# structure lost during that coarse downsampling gives the gate no way to
+# know it's still present in the finer features, so the gate may
+# multiplicatively zero out genuine fine-detail signal.
+#
+# gate_floor=0.1 guarantees at least 10% of the gated features' signal always
+# survives, regardless of how confidently (and possibly wrongly) the gate
+# suppresses that location. Applied to BOTH attention gates in the decoder
+# (att1 and att2), since both share the same underlying risk.
+#
+# Deliberately isolated on top of fusion_only, and deliberately NOT combined
+# with use_fine_skip or the slice-consistency loss in this run -- each
+# decoder-level change is tested completely independently first, per this
+# project's methodology.
+experiment:
+  name: "fusion_only_gatefloor"
+  description: "2.5D -- fusion_only + attention-gate floor (0.1)"
+
+data:
+  three_slice: true
+
+ffpa:
+  fusion_variant: "fusion_only"
+  decoder_gate_floor: 0.1

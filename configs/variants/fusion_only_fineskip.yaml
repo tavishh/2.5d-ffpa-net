@@ -1,0 +1,26 @@
+_base_: ../base.yaml
+
+# fusion_only_fineskip -- tests whether a direct skip from the raw finest-
+# scale features (captured BEFORE attention gating) to just before final
+# refinement helps recover thin/tapering structures. Same motivation as
+# fusion_only_gatefloor (see that config's comments and decoder.py's module
+# docstring for the full reasoning), but a structurally different fix: rather
+# than softening the existing gate, this adds a parallel path that bypasses
+# the gated coarse-to-fine chain entirely for a portion of the signal, so
+# survival of fine detail does not depend ONLY on passing through attention
+# gating that was conditioned on a coarser scale which may have already lost
+# the structure.
+#
+# Deliberately isolated on top of fusion_only, and deliberately NOT combined
+# with decoder_gate_floor or the slice-consistency loss in this run -- each
+# decoder-level change is tested completely independently first.
+experiment:
+  name: "fusion_only_fineskip"
+  description: "2.5D -- fusion_only + fine-detail skip connection"
+
+data:
+  three_slice: true
+
+ffpa:
+  fusion_variant: "fusion_only"
+  decoder_use_fine_skip: true

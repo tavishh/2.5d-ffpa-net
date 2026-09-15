@@ -32,30 +32,34 @@ above (S1, S2, fusion_only, relational_fusion). Must be odd. This is decoupled
 from fusion_variant so any slice-count can be combined with any fusion
 mechanism without adding new variant names.
 
-Positional encoding (config["data"]["use_position_encoding"], default False,
-added 2026-09, corrected after reading the source paper): reproduces Henson et
-al.'s SC-UNet mechanism (PLOS ONE, 2024) precisely, NOT an approximation:
-  - the dataset computes a percentage-along-the-limb bucket (0-99) for each
-    slice (see dataset.py's _get_position_bucket)
-  - this model converts that bucket to a 100-element one-hot vector, passes it
-    through a SEPARATE, small fully-connected layer (100 -> num_classes) --
-    running in PARALLEL to the segmentation backbone, not mixed into the image
-    input at any point
-  - the FC layer's output (one scalar per class) multiplicatively GATES the
-    decoder's final output (and every deep-supervision auxiliary output, if
-    enabled), channel-wise -- exactly as described in the paper ("multiplied
-    with the result of the final convolutional layer")
-An earlier version of this feature concatenated a constant-valued position
-channel into the image input instead; that was a plausible-sounding guess
-made before the source paper was available, not a reproduction of the actual
-method, and has been replaced by this version.
+Positional encoding (config["data"]["use_position_encoding"], default False):
+reproduces Henson et al.'s SC-UNet mechanism (PLOS ONE, 2024): the dataset
+computes a percentage-along-the-limb bucket (0-99) for each slice; this model
+converts that bucket to a 100-element one-hot vector, passes it through a
+separate small fully-connected layer (100 -> num_classes) running in PARALLEL
+to the segmentation backbone, and the result multiplicatively gates the
+decoder's final output (and every deep-supervision auxiliary output).
+
+Decoder-level modifications (config["ffpa"]["decoder_gate_floor"], default
+0.0, and config["ffpa"]["decoder_use_fine_skip"], default False; branch:
+decoder-experiments): motivated by the failure-zone diagnosis -- near-total
+segmentation failures shared across every independently-designed fusion
+mechanism tested so far, pointing to a bottleneck downstream of the fusion
+stage entirely, i.e. in the shared decoder itself. Both default to the values
+that reproduce the ORIGINAL decoder exactly; see decoder.py's module
+docstring for the full mechanism and motivation. Independent of
+fusion_variant, num_slices, and use_position_encoding -- deliberately tested
+in isolation per this project's methodology, not combined without first
+understanding each change on its own.
 
 Cost: S1, fusion_only, and relational_fusion all run the zero-parameter filter
 bank N times per forward (N = num_slices); S0/S2 run it once. SliceCSA is
 ~110 params/scale regardless of N (shared_score). MeanSliceFusion: 0 params.
 RelationalSliceFusion: ~3610 params/scale (3x3 conv, 4F->F channels),
 independent of N. Positional encoding adds a single Linear(100, num_classes)
-layer -- negligible parameter/compute cost regardless of num_classes.
+layer. decoder_gate_floor adds zero parameters (a fixed transform on existing
+gate output). decoder_use_fine_skip adds one small 1x1 conv (c1*c5 + c5
+params, e.g. ~1,640 at base_channels=40).
 """
 
 import torch
@@ -74,8 +78,9 @@ from .decoder import ProgressiveAttentionDecoder
 # fusion_only and relational_fusion share S1's forward path (three_slice=True,
 # use_postfilter=True) -- the only difference is which class gets instantiated
 # for self.slice_fusion, handled below in __init__, not here. The actual
-# NUMBER of slices (3, 5, ...) and positional encoding are separate, orthogonal
-# config keys read directly in __init__, not part of this dict.
+# NUMBER of slices (3, 5, ...), positional encoding, and decoder-level
+# modifications are all separate, orthogonal config keys read directly in
+# __init__, not part of this dict.
 FUSION_VARIANTS = {
     "S0_single_slice":      (False, False, False),
     "S1_postfilter_fusion": (True,  True,  False),
@@ -98,8 +103,9 @@ _NUM_POSITION_BUCKETS = 100
 
 
 class FFPANet25D(nn.Module):
-    """2.5D FFPA-Net with selectable slice-fusion strategy, slice count, and
-    optional SC-UNet-style positional gating.
+    """2.5D FFPA-Net with selectable slice-fusion strategy, slice count,
+    optional SC-UNet-style positional gating, and optional decoder-level
+    modifications.
 
     Args:
         config: experiment config dict. Reads:
@@ -108,6 +114,8 @@ class FFPANet25D(nn.Module):
             config["ffpa"]["fusion_variant"]             (default S0_single_slice)
             config["ffpa"]["use_original_image"]         (default True)
             config["ffpa"]["use_deep_supervision"]       (default True)
+            config["ffpa"]["decoder_gate_floor"]         (default 0.0)
+            config["ffpa"]["decoder_use_fine_skip"]      (default False)
             config["data"]["num_slices"]                 (default 3, must be odd)
             config["data"]["use_position_encoding"]      (default False)
             config["training"]["device"]
@@ -126,6 +134,15 @@ class FFPANet25D(nn.Module):
         self.fusion_variant = ffpa_cfg.get("fusion_variant", "S0_single_slice")
         self.use_original = ffpa_cfg.get("use_original_image", True)
         self.use_deep_supervision = ffpa_cfg.get("use_deep_supervision", True)
+
+        # Decoder-level modifications (branch: decoder-experiments). Both
+        # default to the values that reproduce the ORIGINAL decoder exactly,
+        # so every existing config is unaffected unless explicitly opted in.
+        # See decoder.py's module docstring for the full motivation -- this
+        # targets the failure-zone diagnosis, not the fusion-mechanism
+        # question, so it is deliberately independent of fusion_variant.
+        self.decoder_gate_floor = ffpa_cfg.get("decoder_gate_floor", 0.0)
+        self.decoder_use_fine_skip = ffpa_cfg.get("decoder_use_fine_skip", False)
 
         if self.fusion_variant not in FUSION_VARIANTS:
             raise ValueError(
@@ -177,6 +194,9 @@ class FFPANet25D(nn.Module):
         print(f"    position gate:        {self.use_position}"
               + ("  (SC-UNet style, 100-bucket -> Linear -> multiplicative gate)"
                  if self.use_position else ""))
+        if self.decoder_gate_floor > 0.0 or self.decoder_use_fine_skip:
+            print(f"    decoder mods:         gate_floor={self.decoder_gate_floor}, "
+                  f"fine_skip={self.decoder_use_fine_skip}")
 
         # ── Fixed filter bank (single-channel, unchanged from 2D FFPA-Net) ──
         self.feature_extractor = FixedFilterBank(
@@ -214,13 +234,16 @@ class FFPANet25D(nn.Module):
         if self.use_input_fusion:
             self.csa_input = CrossSliceAttention(in_channels=self.num_slices)
 
-        # ── Decoder (identical to 2D FFPA-Net, untouched by position gating) ─
+        # ── Decoder (identical to 2D FFPA-Net, plus the two opt-in decoder-
+        # level modifications, both defaulting to original behaviour) ──────
         self.decoder = ProgressiveAttentionDecoder(
             in_channels=feature_dims,
             base_channels=base_channels,
             num_classes=self.num_classes,
             use_attention=True,
             use_deep_supervision=self.use_deep_supervision,
+            gate_floor=self.decoder_gate_floor,
+            use_fine_skip=self.decoder_use_fine_skip,
         )
 
         # ── Original-image fusion: centre slice (1ch) + scale-0 feats (10ch) ─
