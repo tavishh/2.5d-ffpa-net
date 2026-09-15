@@ -12,7 +12,7 @@ data:
   root_dir: "data/muscle_top10"      # CONFIRM path to your dataset root
   image_size: 256                    # CONFIRM (dataset default is 256)
   batch_size: 8                      # CONFIRM
-  num_workers: 6
+  num_workers: 2
   three_slice: false                 # variants flip this on for S1/S2
 
 model:
