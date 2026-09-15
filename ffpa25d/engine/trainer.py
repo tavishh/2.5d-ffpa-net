@@ -14,6 +14,17 @@ and passed through to the model as its own argument -- it is NOT part of the
 image tensor. Both _run_epoch (train + val) and Evaluator.evaluate do this
 identically. batch.get("position") returns None for every existing config
 that doesn't use this feature, so nothing changes for any prior run.
+
+Slice-consistency loss (2026-09): when config["training"]["slice_consistency_weight"]
+is > 0 AND the batch includes "image_next" (i.e. the dataset was built with
+use_slice_consistency=True), an additional gentle regularizer penalizes abrupt
+prediction changes between the current slice and the immediately-following
+slice. This is TRAIN-ONLY (not applied during validation, so it never affects
+model-selection/early-stopping directly) and uses a SECOND forward pass on
+images_next. Both predictions are fully differentiable (symmetric consistency,
+not a frozen-teacher setup) -- gradients flow through both slices' predictions
+equally. Cost: roughly doubles per-step forward+backward compute when enabled;
+weight defaults to 0.0 (disabled) for every existing config.
 """
 import csv
 import json
@@ -51,6 +62,27 @@ def _quick_dice_fg(pred: torch.Tensor, target: torch.Tensor, num_classes: int) -
         return float(np.mean(vals))
 
 
+def _slice_consistency_loss(pred: torch.Tensor, pred_next: torch.Tensor) -> torch.Tensor:
+    """Gentle regularizer penalizing abrupt prediction changes between the
+    current slice and the immediately-following slice.
+
+    Operates on softmax PROBABILITIES (not raw logits), so the penalty is
+    naturally bounded in [0, 1] per pixel/class regardless of logit scale --
+    this keeps it comparable in magnitude across training regardless of how
+    confident the model becomes. MSE between the two probability maps: exactly
+    0 for identical predictions, small for gradual/expected anatomical change,
+    larger only for sharp, discontinuous flips -- which is the specific
+    failure pattern this term targets (see the failure-zone diagnosis).
+
+    Both pred and pred_next must be the MAIN output only (not deep-supervision
+    aux heads) -- consistency is about the model's actual prediction, not
+    intermediate training signals.
+    """
+    prob = torch.softmax(pred, dim=1)
+    prob_next = torch.softmax(pred_next, dim=1)
+    return torch.mean((prob - prob_next) ** 2)
+
+
 class Trainer:
     def __init__(self, model, config: Dict, output_dir, device: str = "cuda"):
         self.model = model.to(device)
@@ -72,6 +104,14 @@ class Trainer:
         self.patience = es.get("patience", 15)
         self.min_delta = es.get("min_delta", 0.001)
 
+        # Slice-consistency: defaults to 0.0 (disabled) for every existing
+        # config. Only meaningful when the dataset also returns "image_next"
+        # (data.use_slice_consistency=True) -- checked per-batch below, not
+        # assumed from this weight alone, so a mismatched config (weight>0 but
+        # dataset not producing image_next) fails loudly rather than silently
+        # skipping the regularizer.
+        self.slice_consistency_weight = tcfg.get("slice_consistency_weight", 0.0)
+
         lcfg = config.get("loss", {})
         self.criterion = DeepSupervisionLoss(
             num_classes=self.num_classes,
@@ -92,7 +132,8 @@ class Trainer:
     def train(self, train_loader, val_loader) -> Dict:
         print(f"\nStarting training for {self.epochs} epochs "
               f"({'binary' if self.is_binary else f'{self.num_classes}-class'}, "
-              f"DS={self.use_deep_supervision})...")
+              f"DS={self.use_deep_supervision}, "
+              f"slice_consistency_weight={self.slice_consistency_weight})...")
         last_epoch = 0
         for epoch in range(self.epochs):
             last_epoch = epoch
@@ -133,24 +174,46 @@ class Trainer:
         total_loss, total_dice, n = 0.0, 0.0, 0
         ctx = torch.enable_grad() if train else torch.no_grad()
         desc = f"Epoch {epoch+1}" if train else "  val"
+        # Slice-consistency only applies during TRAINING -- it's a training-time
+        # regularizer, not part of the metric used for model selection/early
+        # stopping, so validation loss/dice stay directly comparable to every
+        # prior run that didn't use this feature.
+        use_consistency = train and self.slice_consistency_weight > 0
         with ctx:
             for batch in tqdm(loader, desc=desc, leave=False):
                 images = batch["image"].to(self.device)
                 masks = batch["mask"].to(self.device)
-                # Positional encoding (SC-UNet style): None for every config
-                # that doesn't use this feature, so no behaviour change there.
                 position = batch.get("position")
                 if position is not None:
                     position = position.to(self.device)
+
                 if train:
                     self.optimizer.zero_grad()
                     outputs = self.model(images, position=position,
                                          return_aux=self.use_deep_supervision)
                     loss = self.criterion(outputs, masks)
+                    main = outputs[0] if isinstance(outputs, tuple) else outputs
+
+                    if use_consistency:
+                        if "image_next" not in batch:
+                            raise ValueError(
+                                "training.slice_consistency_weight > 0 but the "
+                                "batch has no 'image_next' field -- set "
+                                "data.use_slice_consistency=True so the dataset "
+                                "produces it."
+                            )
+                        images_next = batch["image_next"].to(self.device)
+                        # Second forward pass, main output only (no deep
+                        # supervision needed here -- consistency is about the
+                        # model's actual prediction, not training signals).
+                        outputs_next = self.model(images_next, position=position,
+                                                   return_aux=False)
+                        consistency = _slice_consistency_loss(main, outputs_next)
+                        loss = loss + self.slice_consistency_weight * consistency
+
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.optimizer.step()
-                    main = outputs[0] if isinstance(outputs, tuple) else outputs
                 else:
                     outputs = self.model(images, position=position, return_aux=False)
                     loss = self.criterion(outputs, masks)
@@ -206,8 +269,6 @@ class Evaluator:
                 images = batch["image"].to(self.device)
                 masks = batch["mask"].to(self.device)
                 pids, snames = batch["patient_id"], batch["slice_name"]
-                # Positional encoding (SC-UNet style): None for every config
-                # that doesn't use this feature, so no behaviour change there.
                 position = batch.get("position")
                 if position is not None:
                     position = position.to(self.device)
@@ -280,5 +341,5 @@ class Evaluator:
               f"Infer: {eff['inference_time_ms']:.2f} ms")
         print("-" * 64)
         for k in ("dice", "dice_fg", "iou", "iou_fg", "hd95"):
-            print(f"{k:<8}: {m[k]['mean']:.4f} ± {m[k]['std']:.4f}")
+            print(f"{k:<8}: {m[k]['mean']:.4f} \u00b1 {m[k]['std']:.4f}")
         print("=" * 64)

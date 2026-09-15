@@ -4,17 +4,20 @@
 stacking neighbouring slices from the SAME patient volume. Edge slices are
 padded by repeating the boundary slice (replicate padding).
 
-Positional encoding (SC-UNet style, Henson et al. 2024, PLOS ONE): optionally
-returns an additional "position" field -- an integer bucket (0-99) representing
-this slice's percentage position along its patient's volume. This matches the
-ACTUAL SC-UNet mechanism after reading the source paper: a percentage-along-
-the-limb value converted to a 100-element one-hot vector, fed through a small
-fully-connected layer running in PARALLEL to the segmentation network (not
-mixed into the image input). The model (ffpa_net_25d.py) builds the one-hot
-vector and the FC layer; this file only computes the bucket index, using the
-same per-patient index already built for neighbour lookup -- no hand-curated
-region annotation needed, and available identically for every patient in
-every split.
+Positional encoding (SC-UNet style, Henson et al. 2024): optionally returns a
+"position" field -- an integer bucket (0-99) representing this slice's
+percentage position along its patient's volume. See ffpa_net_25d.py for how
+this is consumed (a separate parallel pathway, not mixed into the image).
+
+Slice-consistency support (added 2026-09): optionally returns a SECOND
+stacked window, "image_next", centered one slice further along the same
+patient's volume (clamped at patient boundaries, same replicate-padding rule
+as everything else). This lets the training loop run the model on both the
+current and the immediately-following slice, then penalize abrupt prediction
+changes between them -- a gentle regularizer targeting the discontinuous
+"flip to 0 then back" failure pattern found in the failure-zone diagnosis,
+without needing the model itself to change at all (this is purely a data +
+training-loop addition).
 
 Key invariant: slices within each patient are sorted by filename before the
 flat sample list is built. A per-patient index map (self._patient_slice_idx)
@@ -44,6 +47,12 @@ class PatientSliceDataset(Dataset):
             "position" field -- an integer in [0, 99] giving this slice's
             percentage position along its patient's volume (SC-UNet style).
             Defaults to False. Independent of three_slice/num_slices.
+        use_slice_consistency (bool): If True, each sample's dict ALSO
+            includes an "image_next" field -- the same kind of stacked window
+            as "image", but centered one slice further along this patient's
+            volume. Defaults to False. Requires three_slice=True (a
+            single-slice model has no "window" to shift). Independent of
+            use_position_encoding.
     """
 
     def __init__(
@@ -59,6 +68,7 @@ class PatientSliceDataset(Dataset):
         three_slice=False,
         num_slices=3,
         use_position_encoding=False,
+        use_slice_consistency=False,
     ):
         self.root_dir = Path(root_dir)
         self.split = split
@@ -71,6 +81,13 @@ class PatientSliceDataset(Dataset):
         self.three_slice = three_slice
         self.use_position_encoding = use_position_encoding
 
+        if use_slice_consistency and not three_slice:
+            raise ValueError(
+                "use_slice_consistency=True requires three_slice=True -- a "
+                "single-slice (2D) model has no stacked window to shift."
+            )
+        self.use_slice_consistency = use_slice_consistency
+
         if three_slice:
             if num_slices < 1 or num_slices % 2 == 0:
                 raise ValueError(f"num_slices must be odd and >= 1, got {num_slices}")
@@ -82,6 +99,8 @@ class PatientSliceDataset(Dataset):
             print(f"  Mode: {self.num_slices}-slice stacking (2.5D)")
         if use_position_encoding:
             print(f"  Position encoding: ON (SC-UNet style, 100-bucket % along limb)")
+        if use_slice_consistency:
+            print(f"  Slice-consistency pairing: ON (also returns the next slice's window)")
 
         if not self.is_binary and selected_classes and remap_classes:
             # start=1 so foreground classes remap to 1..N and background
@@ -129,8 +148,8 @@ class PatientSliceDataset(Dataset):
         # _patient_slice_count[patient_id] = total slices for that patient.
         # These are computed ONCE here so __getitem__ can find neighbors in O(1)
         # without any scanning, and crucially without ever crossing boundaries.
-        # The SAME index is reused below for the positional-encoding bucket --
-        # no extra bookkeeping needed.
+        # The SAME index is reused for the positional-encoding bucket AND the
+        # slice-consistency "next slice" lookup -- no extra bookkeeping needed.
         self._build_patient_index()
 
         original_count = len(self.samples)
@@ -200,11 +219,7 @@ class PatientSliceDataset(Dataset):
 
         SC-UNet style (Henson et al. 2024): a percentage-along-the-limb value
         converted to one of num_buckets discrete positions. Bucket 0 = first
-        slice of this patient, bucket num_buckets-1 = last slice. Uses the
-        same _patient_boundaries index already built for neighbour lookup --
-        no dependency on hand-curated region labels (unlike the calf/knee/
-        thigh boundaries used for regional evaluation elsewhere in this
-        project). Available identically for every patient in every split.
+        slice of this patient, bucket num_buckets-1 = last slice.
         """
         first, last = self._patient_boundaries[flat_idx]
         total_minus_one = max(last - first, 1)  # avoid div-by-zero for a
@@ -234,6 +249,29 @@ class PatientSliceDataset(Dataset):
             )
         return np.ascontiguousarray(mask)
 
+    def _build_slice_window(self, center_idx):
+        """Build the (num_slices, H, W) stacked image tensor centered at
+        center_idx. Extracted as its own method (rather than inlined in
+        __getitem__) so it can be called for the CURRENT sample's window and,
+        when slice-consistency is enabled, for the NEXT slice's window too --
+        identical logic, just a different centre.
+
+        Neighbors are clamped to patient boundaries (replicate padding),
+        exactly as for the primary window -- center_idx is assumed to already
+        be a valid flat index within some patient (the caller is responsible
+        for computing it via _get_neighbor_idx if it is not the sample's own
+        index).
+        """
+        imgs = []
+        for offset in range(-self._half_window, self._half_window + 1):
+            if offset == 0:
+                neighbor_idx = center_idx
+            else:
+                neighbor_idx = self._get_neighbor_idx(center_idx, offset)
+            imgs.append(self._load_image(self.samples[neighbor_idx]["image_path"]))
+        image = np.stack(imgs, axis=0).astype(np.float32)
+        return torch.from_numpy(image) / 255.0  # (num_slices, H, W)
+
     # ── Dataset protocol ──────────────────────────────────────────────────────
 
     def __len__(self):
@@ -244,22 +282,7 @@ class PatientSliceDataset(Dataset):
 
         if self.three_slice:
             # ── 2.5D path: stack [prev...curr...next] along channel dim ──────
-            # Generalized to any odd window size via _half_window. For
-            # num_slices=3, offsets are [-1, 0, +1] (unchanged from before).
-            # For num_slices=5, offsets are [-2, -1, 0, +1, +2]. Neighbors are
-            # clamped to patient boundaries (replicate padding) regardless of
-            # window size.
-            imgs = []
-            for offset in range(-self._half_window, self._half_window + 1):
-                if offset == 0:
-                    neighbor_idx = idx
-                else:
-                    neighbor_idx = self._get_neighbor_idx(idx, offset)
-                imgs.append(self._load_image(self.samples[neighbor_idx]["image_path"]))
-
-            # Stack to (num_slices, H, W) and normalise to [0, 1].
-            image = np.stack(imgs, axis=0).astype(np.float32)
-            image = torch.from_numpy(image) / 255.0
+            image = self._build_slice_window(idx)
             # image shape: (num_slices, H, W)
         else:
             # ── 2D baseline path: single-channel, unchanged behaviour ─────────
@@ -291,11 +314,18 @@ class PatientSliceDataset(Dataset):
         }
 
         # ── Positional encoding: a SEPARATE field, not mixed into the image ──
-        # SC-UNet feeds this through its own parallel FC pathway (see
-        # ffpa_net_25d.py), not through the conv backbone -- so it does not
-        # belong inside the image tensor at all.
         if self.use_position_encoding:
             item["position"] = torch.tensor(self._get_position_bucket(idx), dtype=torch.long)
+
+        # ── Slice-consistency: the NEXT slice's window, built the identical
+        # way as the current one, just re-centred. Clamped to the patient's
+        # own last slice (replicate padding) -- if idx is already the last
+        # slice, image_next will be nearly identical to image, which is the
+        # correct degenerate behaviour (no real "next slice" exists, so the
+        # consistency loss should contribute ~0 there, not error out).
+        if self.use_slice_consistency:
+            next_idx = self._get_neighbor_idx(idx, +1)
+            item["image_next"] = self._build_slice_window(next_idx)
 
         return item
 
@@ -325,12 +355,12 @@ def create_dataloaders(config):
     subset_ratio = config.get("debug", {}).get("subset_ratio", 1.0)
     verbose = config.get("debug", {}).get("verbose", False)
 
-    # three_slice flag read from config; defaults to False (2D baseline).
-    # num_slices only matters when three_slice=True; defaults to 3 so every
-    # existing config (which doesn't set this key) is unaffected.
+    # Data-shape flags read from config; all default to False/3 so every
+    # existing config (which doesn't set them) behaves exactly as before.
     three_slice = config.get("data", {}).get("three_slice", False)
     num_slices = config.get("data", {}).get("num_slices", 3)
     use_position_encoding = config.get("data", {}).get("use_position_encoding", False)
+    use_slice_consistency = config.get("data", {}).get("use_slice_consistency", False)
 
     if selected_classes and remap_classes:
         # +1 for background at index 0 (foreground remapped to 1..N)
@@ -344,6 +374,7 @@ def create_dataloaders(config):
         print(f"  Selected classes: {selected_classes}")
     print(f"  3-slice mode: {three_slice}" + (f"  (num_slices={num_slices})" if three_slice else ""))
     print(f"  Position encoding: {use_position_encoding}")
+    print(f"  Slice-consistency pairing: {use_slice_consistency}")
 
     common_kwargs = {
         "root_dir": config["data"]["root_dir"],
@@ -355,6 +386,7 @@ def create_dataloaders(config):
         "three_slice": three_slice,
         "num_slices": num_slices,
         "use_position_encoding": use_position_encoding,
+        "use_slice_consistency": use_slice_consistency,
     }
 
     train_dataset = PatientSliceDataset(

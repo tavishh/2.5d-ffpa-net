@@ -1,0 +1,36 @@
+_base_: ../base.yaml
+
+# fusion_only_sliceconsistency -- tests a gentle regularizer penalizing abrupt
+# prediction changes between adjacent slices, targeting the discontinuous
+# "flip to 0 then back" failure pattern found in the failure-zone diagnosis
+# (patient_004's knee region: Dice snapping between ~1.0 and ~0.0, not
+# gradually declining). Operates on softmax probabilities via MSE, weighted
+# small relative to the primary 0.5 Dice + 0.5 CE loss, so it nudges toward
+# smoothness without penalizing genuine anatomical change (e.g. across the
+# calf->knee->thigh transition) into an over-smoothed mush.
+#
+# Deliberately isolated on top of fusion_only, same reasoning as every other
+# single-variable test in this series: the attention-mechanism question is
+# separately already answered (no fusion mechanism beats simple averaging),
+# so this tests ONLY whether the consistency term itself helps.
+#
+# Cost: roughly doubles per-step training compute (a second forward pass on
+# the next slice's window, every training step) -- affordable now that this
+# runs on dedicated hardware rather than a budget-constrained Colab session.
+# Validation and test-time behaviour are UNCHANGED (consistency loss is
+# train-only), so this run is directly comparable to fusion_only's existing
+# result (knee Dice_FG 0.7411, knee detection rate 93.51%) on every reported
+# metric.
+experiment:
+  name: "fusion_only_sliceconsistency"
+  description: "2.5D -- fusion_only + slice-consistency regularizer"
+
+data:
+  three_slice: true
+  use_slice_consistency: true
+
+ffpa:
+  fusion_variant: "fusion_only"
+
+training:
+  slice_consistency_weight: 0.1
